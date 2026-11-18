@@ -6,6 +6,8 @@ import json
 import os
 from dataclasses import dataclass
 
+from .grants import derive_grant_secret
+
 
 @dataclass(frozen=True)
 class Target:
@@ -28,6 +30,9 @@ class Config:
     host: str
     port: int
     max_closed_generations: int = 100
+    protect_downloads: bool = False
+    admin_key: str | None = None
+    grant_secret: str | None = None
 
 
 def _parse_targets(raw: str) -> dict[str, Target]:
@@ -77,6 +82,18 @@ def _env_float(env: dict[str, str], name: str, default: float) -> float:
     return value
 
 
+def _env_bool(env: dict[str, str], name: str, default: bool = False) -> bool:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be a boolean (got {raw!r})")
+
+
 def load_config(env: dict[str, str] | None = None) -> Config:
     e: dict[str, str] = dict(os.environ) if env is None else env
     targets = _parse_targets(e.get("RELAY_TARGETS", "blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002"))
@@ -98,6 +115,17 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     probe_path = e.get("RELAY_PROBE_PATH", "/ready")
     if not probe_path.startswith("/"):
         probe_path = "/" + probe_path
+    protect_downloads = _env_bool(e, "RELAY_PROTECT_DOWNLOADS", False)
+    admin_key = e.get("RELAY_ADMIN_KEY") or None
+    grant_secret = e.get("RELAY_GRANT_SECRET") or None
+    if grant_secret is None and admin_key is not None:
+        # Derive, don't reuse: the signing secret is then never the same
+        # string as the key operators present to the grants endpoint.
+        grant_secret = derive_grant_secret(admin_key)
+    if protect_downloads and grant_secret is None:
+        raise ValueError(
+            "RELAY_PROTECT_DOWNLOADS=1 requires RELAY_ADMIN_KEY or RELAY_GRANT_SECRET"
+        )
     return Config(
         targets=targets,
         initial=initial,
@@ -110,4 +138,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         host=e.get("RELAY_HOST", "0.0.0.0"),
         port=int(e.get("RELAY_PORT", "8080")),
         max_closed_generations=max_closed,
+        protect_downloads=protect_downloads,
+        admin_key=admin_key,
+        grant_secret=grant_secret,
     )

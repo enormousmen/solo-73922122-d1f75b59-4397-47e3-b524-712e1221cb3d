@@ -8,6 +8,11 @@
 #
 # The upstreams are also reachable inside the network as http://blue:9001 and
 # http://green:9001.
+#
+# The relay runs with download protection ON and the LOCAL EXAMPLE admin key
+# below: every proxied GET/HEAD needs a grant from POST /api/download-grants
+# (try it from /docs — click "Authorize" and paste the key). Replace the key
+# before using this stack anywhere real.
 name: artifact-relay
 
 services:
@@ -23,6 +28,10 @@ services:
       RELAY_DRAIN_SECONDS: "5"
       RELAY_CHUNK_SIZE: "65536"
       RELAY_LOG_LEVEL: "INFO"
+      # Protection mode with a local example key. The grant-signing secret is
+      # derived from this key; set RELAY_GRANT_SECRET to manage it separately.
+      RELAY_PROTECT_DOWNLOADS: "1"
+      RELAY_ADMIN_KEY: "dev-admin-key-change-me"
     ports:
       - "8080:8080"
     depends_on:

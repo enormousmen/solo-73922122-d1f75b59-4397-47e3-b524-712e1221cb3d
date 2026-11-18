@@ -92,6 +92,11 @@ async def _state(request):
     )
 
 
+async def _echo(request):
+    """Reflect the request headers: lets tests assert what reached upstream."""
+    return JSONResponse({"headers": dict(request.headers)})
+
+
 def make_app(name: str) -> Starlette:
     app = Starlette(
         routes=[
@@ -99,6 +104,7 @@ def make_app(name: str) -> Starlette:
             Route("/healthz", _healthz),
             Route("/artifact", _artifact),
             Route("/fixed", _fixed),
+            Route("/_echo", _echo),
             Route("/_control/probe", _control, methods=["POST", "GET"]),
             Route("/_state", _state),
         ]

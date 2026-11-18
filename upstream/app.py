@@ -64,14 +64,18 @@ async def control_probe_get():
     return {"upstream": NAME, **state}
 
 
-@app.get("/artifact")
+@app.api_route("/artifact", methods=["GET", "HEAD"])
 async def artifact(
     request: Request,
     bytes: int = 1024 * 1024,
     chunk: int = 65536,
     delay: float = 0.0,
 ):
-    """Stream ``bytes`` bytes with ``delay`` seconds between chunks."""
+    """Stream ``bytes`` bytes with ``delay`` seconds between chunks.
+
+    HEAD is supported explicitly (FastAPI's ``@app.get`` would 405 it) so the
+    relay's HEAD grant flow can be exercised end to end against this demo.
+    """
     bytes = max(0, min(bytes, 512 * 1024 * 1024))
     chunk = max(1, min(chunk, 1024 * 1024))
     delay = max(0.0, min(delay, 10.0))

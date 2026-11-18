@@ -55,19 +55,24 @@ class Server:
                 await asyncio.wait_for(self.task, timeout=5)
 
 
-async def start_stack(drain_seconds: float = 1.0, probe_timeout: float = 0.5):
+async def start_stack(
+    drain_seconds: float = 1.0,
+    probe_timeout: float = 0.5,
+    extra_env: dict[str, str] | None = None,
+):
     ports = {name: free_port() for name in ("blue", "green", "relay")}
     upstreams = {}
     for name in ("blue", "green"):
         upstreams[name] = await Server(make_app(name), ports[name]).start()
-    config = load_config(
-        {
-            "RELAY_TARGETS": f"blue=http://127.0.0.1:{ports['blue']},green=http://127.0.0.1:{ports['green']}",
-            "RELAY_INITIAL_TARGET": "blue",
-            "RELAY_DRAIN_SECONDS": str(drain_seconds),
-            "RELAY_PROBE_TIMEOUT": str(probe_timeout),
-        }
-    )
+    env = {
+        "RELAY_TARGETS": f"blue=http://127.0.0.1:{ports['blue']},green=http://127.0.0.1:{ports['green']}",
+        "RELAY_INITIAL_TARGET": "blue",
+        "RELAY_DRAIN_SECONDS": str(drain_seconds),
+        "RELAY_PROBE_TIMEOUT": str(probe_timeout),
+    }
+    if extra_env:
+        env.update(extra_env)
+    config = load_config(env)
     relay_app = RelayApp(config)
     relay = await Server(relay_app.app, ports["relay"], timeout_graceful_shutdown=1).start()
     return {

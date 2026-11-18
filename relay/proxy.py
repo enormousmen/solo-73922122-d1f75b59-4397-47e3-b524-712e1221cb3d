@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from contextlib import asynccontextmanager, suppress
-from typing import Iterable
+from typing import Iterable, Literal
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.types import Receive, Scope, Send
 
 from .config import Config
 from .generations import Generation, HOP_BY_HOP, InFlightRequest, RelayState
+from .grants import MAX_TTL_SECONDS, GrantReject, derive_grant_secret, issue_grant, verify_grant
 
 log = logging.getLogger("relay.proxy")
 
@@ -51,14 +54,24 @@ def _strip_hop_by_hop(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
     return [(k, v) for k, v in headers if k.lower() not in drop]
 
 
-def _target_url(generation: Generation, scope: Scope) -> str:
+def _raw_path_and_query(scope: Scope) -> tuple[str, str]:
+    """The path and query exactly as the client sent them.
+
+    Grants bind to these raw bytes, so the same helper feeds both the
+    upstream URL and the grant check — they can never drift apart.
+    """
     raw_path = scope.get("raw_path")
     path = raw_path.decode("latin-1") if raw_path else scope.get("path", "/")
     if not path.startswith("/"):
         path = "/" + path
-    query = scope.get("query_string", b"")
+    query = scope.get("query_string", b"").decode("latin-1")
+    return path, query
+
+
+def _target_url(generation: Generation, scope: Scope) -> str:
+    path, query = _raw_path_and_query(scope)
     if query:
-        path = path + "?" + query.decode("latin-1")
+        path = path + "?" + query
     return generation.base_url + path
 
 
@@ -66,6 +79,34 @@ class SwitchRequest(BaseModel):
     target: str = Field(..., description="Target name from RELAY_TARGETS", min_length=1)
     wait: bool = Field(False, description="Block until the readiness probe finishes")
     wait_timeout: float = Field(30.0, gt=0, le=30.0, description="Max seconds to wait")
+
+
+class DownloadGrantRequest(BaseModel):
+    path: str = Field(
+        ...,
+        min_length=1,
+        pattern="^/",
+        description=(
+            "Raw path exactly as the client will request it (percent-encoded form), "
+            "e.g. /artifact"
+        ),
+    )
+    query: str = Field(
+        "",
+        description="Raw query string without '?'; must match the request byte for byte",
+    )
+    method: Literal["GET", "HEAD"] = Field("GET", description="Method the grant covers")
+    ttl_seconds: int = Field(
+        MAX_TTL_SECONDS,
+        gt=0,
+        le=MAX_TTL_SECONDS,
+        description="Validity in seconds; hard-capped at 600 (10 minutes)",
+    )
+
+
+# Separate scheme object so /docs shows the bearer box only for the grants
+# endpoint; the admin key is the only credential it accepts.
+admin_key_scheme = HTTPBearer(auto_error=False, description="Admin key (RELAY_ADMIN_KEY)")
 
 
 class RelayApp:
@@ -118,7 +159,12 @@ class RelayApp:
                 "`RELAY_DRAIN_SECONDS` (default 5s); when the window expires only that "
                 "generation's unfinished requests are interrupted. Requests on newer "
                 "generations are untouched.\n"
-                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n\n"
+                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n"
+                "* With `RELAY_PROTECT_DOWNLOADS=1`, every proxied GET/HEAD needs a "
+                "bearer grant from `POST /api/download-grants` (admin key). A grant "
+                "lives at most 10 minutes and covers exactly one generation, method, "
+                "path and query string; after a switch, old-generation grants are "
+                "rejected and fresh ones must be minted.\n\n"
                 "Open **GET /demo** for a click-through download demo."
             ),
             lifespan=self.lifespan,
@@ -127,6 +173,7 @@ class RelayApp:
         app.get("/api/targets", tags=["relay"])(self.api_targets)
         app.post("/api/switch", tags=["relay"])(self.api_switch)
         app.get("/api/operations/{operation_id}", tags=["relay"])(self.api_operation)
+        app.post("/api/download-grants", tags=["relay"])(self.api_download_grant)
         app.get("/demo", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
         app.get("/", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
         # The GET catch-all must be registered last.
@@ -137,7 +184,13 @@ class RelayApp:
     async def api_status(self) -> JSONResponse:
         # Synchronous snapshot: never awaits a probe, a download, or a lock,
         # so a slow probe/download cannot block this endpoint.
-        return JSONResponse(self.state.snapshot(), headers=JSON_HEADERS)
+        payload = self.state.snapshot()
+        payload["protection"] = {
+            "enabled": self.config.protect_downloads,
+            "grants_endpoint": self.config.admin_key is not None,
+            "grant_max_ttl_seconds": MAX_TTL_SECONDS,
+        }
+        return JSONResponse(payload, headers=JSON_HEADERS)
 
     async def api_targets(self) -> JSONResponse:
         return JSONResponse(
@@ -175,6 +228,65 @@ class RelayApp:
                 return JSONResponse({"operation": operation.to_dict()}, headers=JSON_HEADERS)
         raise HTTPException(status_code=404, detail=f"no operation {operation_id}")
 
+    async def api_download_grant(
+        self,
+        body: DownloadGrantRequest,
+        credentials: HTTPAuthorizationCredentials | None = Depends(admin_key_scheme),
+    ) -> JSONResponse:
+        """Mint a download grant bound to the current generation.
+
+        Authorize with the admin key (`Authorization: Bearer <RELAY_ADMIN_KEY>`).
+        The returned token goes to the client, which presents it as
+        `Authorization: Bearer <grant>` on the matching GET/HEAD.  Grants are
+        checked by the relay only and are never forwarded upstream.
+        """
+        admin_key = self.config.admin_key
+        if admin_key is None:
+            raise HTTPException(
+                status_code=503,
+                detail="download grants are disabled: RELAY_ADMIN_KEY is not configured",
+            )
+        if credentials is None or not hmac.compare_digest(
+            credentials.credentials.encode("utf-8"), admin_key.encode("utf-8")
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="missing or invalid admin key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token, payload = issue_grant(
+            # load_config derives grant_secret from the admin key when it is
+            # not set explicitly; derive again here so a hand-built Config
+            # cannot silently sign with an empty secret.
+            self.config.grant_secret or derive_grant_secret(admin_key),
+            generation=self.state.current.id,
+            method=body.method,
+            path=body.path,
+            query=body.query,
+            ttl_seconds=body.ttl_seconds,
+        )
+        log.info(
+            "issued download grant: generation=%s method=%s path=%s ttl=%ss",
+            payload["gen"],
+            payload["m"],
+            payload["p"],
+            payload["exp"] - payload["iat"],
+        )
+        return JSONResponse(
+            {
+                "grant": token,
+                "authorization": f"Bearer {token}",
+                "token_type": "bearer",
+                "expires_at": payload["exp"],
+                "expires_in_seconds": payload["exp"] - payload["iat"],
+                "generation": payload["gen"],
+                "method": payload["m"],
+                "path": payload["p"],
+                "query": payload["q"],
+            },
+            headers=JSON_HEADERS,
+        )
+
     async def demo_page(self) -> HTMLResponse:
         return HTMLResponse(DEMO_HTML)
 
@@ -185,12 +297,25 @@ class RelayApp:
         # either happened before this tick (new target) or happens after (this
         # request belongs to the old generation and drains normally).
         generation = self.state.current
+        if self.config.protect_downloads:
+            # Check the grant before the request costs anything (in-flight
+            # slot, upstream connection).  The generation read above is the
+            # one the grant must name, so a grant minted before a switch
+            # stops working the moment the new generation commits.
+            rejection = self._check_grant(scope, generation)
+            if rejection is not None:
+                return rejection
         in_flight = generation.register(scope.get("path", "/"))
 
+        drop_headers = {"host", "content-length"}
+        if self.config.protect_downloads:
+            # The grant (and any other client credential) is for the relay
+            # only: neither it nor the admin key may ever reach an upstream.
+            drop_headers.add("authorization")
         request_headers = [
             (k, v)
             for k, v in _strip_hop_by_hop(_header_pairs(scope.get("headers", [])))
-            if k.lower() not in ("host", "content-length")
+            if k.lower() not in drop_headers
         ]
         url = _target_url(generation, scope)
 
@@ -277,6 +402,43 @@ class RelayApp:
                     await disconnect_task
                 abort_wait.cancel()
                 generation.unregister(in_flight)
+
+    def _check_grant(self, scope: Scope, generation: Generation) -> JSONResponse | None:
+        """Verify the bearer grant for a proxied GET/HEAD; None means allowed."""
+        authorization = ""
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"authorization":
+                authorization = value.decode("latin-1")
+                break
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return self._grant_error(
+                401,
+                "grant_required",
+                "protection mode is on: mint a grant via POST /api/download-grants "
+                "and send it as 'Authorization: Bearer <grant>'",
+            )
+        path, query = _raw_path_and_query(scope)
+        try:
+            verify_grant(
+                self.config.grant_secret or "",
+                token.strip(),
+                generation=generation.id,
+                method=scope.get("method", "GET"),
+                path=path,
+                query=query,
+            )
+        except GrantReject as reject:
+            return self._grant_error(reject.status, reject.reason, reject.detail)
+        return None
+
+    def _grant_error(self, status: int, error: str, detail: str) -> JSONResponse:
+        headers = dict(JSON_HEADERS)
+        if status == 401:
+            headers["www-authenticate"] = 'Bearer realm="artifact-relay"'
+        return JSONResponse(
+            {"error": error, "detail": detail}, status_code=status, headers=headers
+        )
 
     def _drain_response(self, in_flight: InFlightRequest, generation: Generation) -> JSONResponse:
         return JSONResponse(
@@ -505,28 +667,74 @@ DEMO_HTML = """<!doctype html>
 
 <h2>Download demo</h2>
 <p>Links go through the relay at its current target. Start a slow download, then switch.</p>
-<div class="row">
-  <a target="_blank" href="/artifact?bytes=1048576&chunk=65536&delay=0.2">1 MiB fast</a>
-  <a target="_blank" href="/artifact?bytes=3145728&chunk=32768&delay=0.5">3 MiB slow (≈45s)</a>
-  <a target="_blank" href="/artifact?bytes=10485760&chunk=65536&delay=0.05">10 MiB medium</a>
+<div class="row" id="protection-row" style="display:none">
+  <strong>Protection mode is on.</strong>
+  <label>Admin key <input id="admin-key" type="password" size="22" placeholder="RELAY_ADMIN_KEY"></label>
+  <span class="muted">each download first mints a grant via <code>POST /api/download-grants</code>
+  (bound to the current generation, this exact URL, 10&nbsp;min max)</span>
 </div>
+<div class="row">
+  <a target="_blank" href="/artifact?bytes=1048576&chunk=65536&delay=0.2" onclick="return dlClick(event, this)">1 MiB fast</a>
+  <a target="_blank" href="/artifact?bytes=3145728&chunk=32768&delay=0.5" onclick="return dlClick(event, this)">3 MiB slow (≈45s)</a>
+  <a target="_blank" href="/artifact?bytes=10485760&chunk=65536&delay=0.05" onclick="return dlClick(event, this)">10 MiB medium</a>
+</div>
+<div class="row"><span id="dl-msg" class="muted"></span></div>
 <p class="muted">Both upstreams expose <code>/artifact</code> and a probe-delay control:
   <code>curl -X POST 'http://localhost:9001/_control/probe?delay=4'</code>,
   <code>curl -X POST 'http://localhost:9002/_control/probe?delay=4'</code>.
   Add <code>&amp;status=503</code> to make the probe fail.</p>
 
 <script>
+let protectionOn = false;
 async function refresh() {
   try {
     const r = await fetch('/api/status');
     const s = await r.json();
+    protectionOn = !!(s.protection && s.protection.enabled);
+    document.getElementById('protection-row').style.display = protectionOn ? 'flex' : 'none';
     document.getElementById('current').textContent =
       `target=${s.current.target} generation=${s.current.generation} base=${s.current.base_url}\\n` +
-      `pending=${s.pending ? s.pending.target + ' #' + s.pending.id + ' (' + s.pending.status + ')' : 'none'}`;
+      `pending=${s.pending ? s.pending.target + ' #' + s.pending.id + ' (' + s.pending.status + ')' : 'none'}` +
+      ` protection=${protectionOn ? 'on' : 'off'}`;
     document.getElementById('generations').innerHTML = s.generations.map(g =>
       `<tr><td>${g.id}</td><td>${g.target}</td><td>${g.state}</td><td>${g.in_flight}</td>` +
       `<td>${g.drain_remaining_seconds ?? ''}</td></tr>`).join('');
   } catch (e) { /* transient */ }
+}
+function dlClick(ev, a) {
+  if (!protectionOn) return true;  // open relay: plain navigation, as before
+  ev.preventDefault();
+  protectedDownload(a);
+  return false;
+}
+async function protectedDownload(a) {
+  const msg = document.getElementById('dl-msg');
+  const key = document.getElementById('admin-key').value;
+  if (!key) { msg.textContent = 'enter the admin key first'; return; }
+  const u = new URL(a.getAttribute('href'), location.origin);
+  try {
+    msg.textContent = 'minting grant…';
+    const g = await fetch('/api/download-grants', {
+      method: 'POST',
+      headers: {'content-type': 'application/json', 'authorization': 'Bearer ' + key},
+      body: JSON.stringify({path: u.pathname, query: u.search.replace(/^\\?/, ''), method: 'GET'})
+    });
+    const gj = await g.json();
+    if (!g.ok) { msg.textContent = `grant refused: ${g.status} ${gj.detail || ''}`; return; }
+    msg.textContent = `grant ok (generation ${gj.generation}), downloading…`;
+    const r = await fetch(u.pathname + u.search, {headers: {'authorization': gj.authorization}});
+    if (!r.ok) { msg.textContent = `download refused: ${r.status} ${await r.text()}`; return; }
+    const blob = await r.blob();
+    const obj = URL.createObjectURL(blob);
+    const tmp = document.createElement('a');
+    tmp.href = obj;
+    tmp.download = `artifact-${blob.size}.bin`;
+    document.body.appendChild(tmp);
+    tmp.click();
+    tmp.remove();
+    URL.revokeObjectURL(obj);
+    msg.textContent = `saved ${blob.size} bytes via grant on generation ${gj.generation}`;
+  } catch (e) { msg.textContent = 'error: ' + e; }
 }
 async function switchTo(target) {
   document.getElementById('switch-msg').textContent = `probing ${target}…`;
